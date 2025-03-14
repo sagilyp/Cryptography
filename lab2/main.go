@@ -7,12 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
-
-	//"os"
 	"math/big"
-	"sync"
-	"sync/atomic"
+	"os"
 	"time"
+	"unsafe"
 
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
@@ -25,16 +23,13 @@ import (
 const (
 	MinOut             = 8
 	MaxOut             = 24
-	MsgLen             = 16
-	DistBits           = 4
+	MsgLen             = 6
+	DistBits           = 2
 	NumWorkers         = 4
 	NumCollisionNeeded = 150
-	OverheadBytes      = 10
-	maxSeenSize        = 10000
 )
 
 var OutBitsList = []int{8, 10, 12, 14, 16, 18, 20, 22, 24}
-var globalWorkerID int64 = 0
 
 // Структура для хранения пары сообщений, давшей одинаковый хэш
 type Collision struct {
@@ -58,7 +53,7 @@ type Result struct {
 }
 
 // Усечённая хэш-функция
-// выичисляет SHA-256 от msg и возвращает последние outbits бит в виде строки из "0" и "1"
+// вычисляет SHA-256 от msg и возвращает последние outbits бит в виде строки из "0" и "1"
 func SHA_xx(msg []byte, outbits int) (string, error) {
 	if outbits < MinOut || outbits > MaxOut {
 		return "", errors.New("Invalid out vector size")
@@ -67,18 +62,28 @@ func SHA_xx(msg []byte, outbits int) (string, error) {
 	hashInt := new(big.Int).SetBytes(hash[:])
 
 	mask := new(big.Int).Lsh(big.NewInt(1), uint(outbits))
-	mask.Sub(mask, big.NewInt(1)) // 00...0111.111
+	mask.Sub(mask, big.NewInt(1)) // == 00...0111.111
 	result := new(big.Int).And(hashInt, mask)
 	return fmt.Sprintf("%0*b", outbits, result), nil
 }
 
 func containColl(arr []Collision, data Collision) bool {
 	for _, val := range arr {
-		if val.x == data.x && val.y == data.y {
+		if val.x == data.x && val.y == data.y || val.x == data.y && val.y == data.x {
 			return true
 		}
 	}
 	return false
+}
+
+// randomState генерирует случайное состояние в виде двоичной строки длины outBits.
+func randomState(outBits int) (string, error) {
+	max := new(big.Int).Lsh(big.NewInt(1), uint(outBits))
+	n, err := rand.Int(rand.Reader, max)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%0*b", outBits, n), nil
 }
 
 // Атака на основе парадокса о днях рождения
@@ -89,8 +94,8 @@ func birthdayAttack(num int, outBits int) ([]Collision, int, int, time.Duration,
 	dict := make(map[string]string)
 	iterations := 0
 	start := time.Now()
+	v := make([]byte, MsgLen)
 	for len(collisions) < num {
-		v := make([]byte, MsgLen)
 		if n, err := rand.Read(v); err != nil || n != MsgLen {
 			return nil, iterations, 0, time.Since(start), errors.New("failed to generate random vector")
 		}
@@ -108,7 +113,9 @@ func birthdayAttack(num int, outBits int) ([]Collision, int, int, time.Duration,
 		iterations++
 	}
 	passed := time.Since(start)
-	mem := len(dict)*outBits + OverheadBytes
+	mem := len(dict)*outBits + int(unsafe.Sizeof(v))*8
+	fmt.Printf("Birthday Attack(%d-bit): Found %d collisions after %d iterations (%s elapsed).\n",
+		outBits, len(collisions), iterations, passed)
 	return collisions, iterations, mem, passed, nil
 }
 
@@ -124,156 +131,218 @@ func isDistinguished(s string, distinguishedBits int) bool {
 	return true
 }
 
-// randomState генерирует случайное состояние в виде двоичной строки длины outBits.
-func randomState(outBits int) (string, error) {
-	max := new(big.Int).Lsh(big.NewInt(1), uint(outBits))
-	n, err := rand.Int(rand.Reader, max)
+// инъективная функция конкатенации трёх нулей в конец
+func P(x string) string {
+	return x + "0000"
+}
+
+func binToHex(binStr string) (string, error) {
+	n, ok := new(big.Int).SetString(binStr, 2)
+	if !ok {
+		return "", errors.New("invalid binary string")
+	}
+	return fmt.Sprintf("%x", n), nil
+}
+
+// Функция для преобразования двоичной строки в байтовый срез
+func binToBytes(binStr string) ([]byte, error) {
+	// Проверка, что строка содержит только '0' и '1'
+	for _, c := range binStr {
+		if c != '0' && c != '1' {
+			return nil, errors.New("binary string contains invalid characters")
+		}
+	}
+	hexStr, _ := binToHex(binStr)
+	// // Дополнение строки нулями слева, чтобы её длина была кратна 8
+	// padding := (8 - len(binStr)%8) % 8
+	// binStr = fmt.Sprintf("%s%s", string(make([]byte, padding)), binStr)
+
+	// // Преобразование в 16-ричную строку
+	// n, ok := new(big.Int).SetString(binStr, 2)
+	// if !ok {
+	// 	return nil, errors.New("invalid binary string")
+	// }
+	// hexStr := fmt.Sprintf("%x", n)
+
+	// // Если длина нечётная, добавляем ведущий 0 (hex требует чётной длины)
+	if len(hexStr)%2 != 0 {
+		hexStr = "0" + hexStr
+	}
+
+	// Декодируем hex в байты
+	return hex.DecodeString(hexStr)
+}
+
+func chainFunc(x string, outBits int) (string, error) {
+	xb, _ := binToBytes(x)
+	hash, err := SHA_xx(xb, outBits)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%0*b", outBits, n), nil
+	// Применяем инъективную функцию:
+	appended := P(hash)
+	// appended имеет длину outBits+3, поэтому берём последние outBits символов:
+	if len(appended) < outBits {
+		return "", errors.New("chainFunc: result length too short")
+	}
+	return appended, nil
 }
 
-// workerChain запускает цепочку: начиная с начального состояния seed, итеративно вычисляет f(x)=TruncatedSHA(x, outBits).
-// Как только найдено отличительное значение (isDistinguished==true), отправляет результат в канал.
-func doWorker(outBits, distBits, workerID int, stopCh <-chan struct{}) *Chain {
-	seed, err := randomState(outBits)
-	if err != nil {
-		return nil
-	}
-	current := seed
-	steps := 0
-	for {
-		select {
-		case <-stopCh:
-			return nil
-		default:
-		}
-		next, err := SHA_xx([]byte(current), outBits)
+// Для двух цепочек, у которых найдено одно и то же отличительное значение,
+// применяем разность d = i - j к цепочке с большим номером, затем итеративно идём синхронно,
+// пока не найдём точное совпадение.
+func findExactCollision(seedA, seedB string, delta int, outBits int) (Collision, error) {
+	//	fmt.Println("Здесь дельта должна быть положительной >>", delta)
+	var valA, valB string
+	var err error
+	// От итога начальной цепочки длиннее, вычисляем d итераций.
+	// будем начинать с seed длиннее
+	valA = seedA
+	valB = seedB
+	for i := 0; i < delta; i++ {
+		valA, err = chainFunc(valA, outBits)
 		if err != nil {
-			return nil
-		}
-		steps++
-		current = next
-		if isDistinguished(current, distBits) {
-			return &Chain{seed: seed, val: current, steps: steps, WID: workerID}
-		}
-		if steps > 1e6 {
-			seed, err = randomState(outBits)
-			if err != nil {
-				return nil
-			}
-			current = seed
-			steps = 0
+			return Collision{}, err
 		}
 	}
+	var collision Collision
+	for i := 0; i < 10e6; i++ {
+		collision = Collision{x: valA, y: valB}
+		valA, err = chainFunc(valA, outBits)
+		valB, err = chainFunc(valB, outBits)
+		if err != nil {
+			return Collision{}, err
+		}
+		if valA == valB {
+			return collision, nil
+		}
+	}
+	return Collision{}, errors.New("exact collision not found")
 }
 
-// spawnWorker всегда выдаёт новый уникальный идентификатор.
-func spawnWorker(outBits, distBits int, results chan<- Chain, stopCh <-chan struct{}, wg *sync.WaitGroup) {
-	newID := int(atomic.AddInt64(&globalWorkerID, 1))
-	wg.Add(1)
-	go func(WID int) {
-		defer wg.Done()
-		chain := doWorker(outBits, distBits, WID, stopCh)
-		if chain == nil {
-			return
-		}
-		select {
-		case results <- *chain:
-		case <-stopCh:
-			return
-		}
-	}(newID)
-}
-
-// Атака Полларада(на горутинах)
-// при обнаружении двух разных seed, давших совпадающие значения, начинается поиск коллизии
+// ----------------------- Полная симуляция атаки Полларда -----------------------
+//
+// Здесь мы запускаем несколько цепочек (симуляция параллельности) и сохраняем каждую отличительную точку.
+// Если для одного и того же отличительного значения найдена коллизия (даже внутри одной цепочки),
+// переходим ко второму этапу: находим точное совпадение, используя разность итераций.
 func PollardAttack(outBits int, distinguishedBits int, numColls int, numWorkers int) ([]Collision, int, int, time.Duration, error) {
-	resultsCh := make(chan Chain, numWorkers*1000)
-	stopCh := make(chan struct{})
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	// Основной сборщик результатов.
-	seen := make(map[string]Chain)
+	// Массив цепочек: по одной на каждый "поток"
+	chains := make([]Chain, numWorkers)
+	// Глобальный map для хранения отличительных точек: ключ — значение цепочки, значение — сама цепочка
+	dists := make(map[string]Chain)
 	collisions := []Collision{}
 	iterations := 0
-	// Запускаем ровно numWorkers воркеров, которые работают в цикле
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for {
-				select {
-				case <-stopCh:
-					return
-				default:
-				}
-				chain := doWorker(outBits, distinguishedBits, id, stopCh)
-				if chain == nil {
-					continue
-				}
-				select {
-				case resultsCh <- *chain:
-				case <-stopCh:
-					return
-				}
-			}
-		}(i)
-	}
 	start := time.Now()
-
-	// Отдельная горутина закрывает resultsCh после завершения всех воркеров.
-	go func() {
-		wg.Wait()
-		close(resultsCh)
-	}()
-	for {
-		select {
-		case res, ok := <-resultsCh:
-			if !ok {
-				goto endLoop
-			}
-			iterations++
-			if res == (Chain{}) {
-				continue
-			}
-			mu.Lock()
-			if prev, exists := seen[res.val]; exists {
-				//независимо от того совпадают ли сиды или нет
-				collisions = append(collisions, Collision{x: prev.seed, y: res.seed})
-				fmt.Printf("Collision found: %s = %s (from workers %d and %d, iterations %d vs %d)\n",
-					res.val, res.val, prev.WID, res.WID, prev.steps, res.steps)
-				if len(collisions) >= numColls {
-					close(stopCh)
-					mu.Unlock()
-					goto endLoop
-				}
-			} else {
-				seen[res.val] = res
-			}
-			mu.Unlock()
-		case <-time.After(10 * time.Second):
-			fmt.Println("Still searching for collisions in Pollard Rho...")
+	successTime := time.Duration(0)
+	//successCount := 0
+	reset := func(chains []Chain, id int, outBits int) error {
+		seed, err := randomState(outBits)
+		if err != nil {
+			return err
+		}
+		chains[id] = Chain{seed: seed, val: seed, steps: 0, WID: id}
+		return nil
+	}
+	// Инициализируем цепочки
+	for i := 0; i < numWorkers; i++ {
+		err := reset(chains, i, outBits)
+		if err != nil {
+			return nil, iterations, 0, time.Since(start), err
 		}
 	}
-endLoop:
-	// Закрываем resultsCh после завершения всех воркеров.
-	wg.Wait()
-	passed := time.Since(start)
-	mem := len(seen)*outBits + OverheadBytes
-	fmt.Printf("Pollard Rho Attack (parallel, %d-bit, distinguishedBits=%d): Found %d collisions after %d iterations (%s elapsed).\n",
-		outBits, distinguishedBits, len(collisions), iterations, passed)
-	return collisions, iterations, mem, passed, nil
+
+	// Основной цикл: обновляем все цепочки, имитируя параллельность.
+	for len(collisions) < numColls {
+		if iterations >= 10e4 {
+			for i := 0; i < numWorkers; i++ {
+				err := reset(chains, i, outBits)
+				if err != nil {
+					return nil, iterations, 0, time.Since(start), err
+				}
+			}
+			for key := range dists { // удаляем значительную точку
+				delete(dists, key)
+			}
+			iterations = 0
+			continue
+		}
+		iterations++
+		for i := 0; i < numWorkers; i++ {
+			// Вычисляем новое значение для цепочки i
+			next, err := chainFunc(chains[i].val, outBits)
+			if err != nil {
+				continue
+			}
+			chains[i].steps++
+			chains[i].val = next
+			//fmt.Println("Итерация:", i, "посчитанное значение:", chains[i].val)
+			// Если найдено отличительное значение, проверяем в глобальному слварю
+			if isDistinguished(chains[i].val, distinguishedBits) {
+				if val, exists := dists[chains[i].val]; exists { // если уже была такая отличительная точка
+					//		fmt.Printf("Цепочка %d зерно %s значение %s шаг %d айди %d\n", i, chains[i].seed, chains[i].val, chains[i].steps, chains[i].WID)
+					// Здесь фиксируем коллизию – независимо от того, совпадают ли seed или нет,
+					// поскольку по заданию коллизия может быть найдена даже внутри одной цепочки.
+					// Для точного поиска коллизии переходим ко второму этапу.
+					var longerChain, shorterChain Chain
+					if val.steps >= chains[i].steps {
+						longerChain, shorterChain = val, chains[i]
+					} else {
+						longerChain, shorterChain = chains[i], val
+					}
+					delta := longerChain.steps - shorterChain.steps
+					collisionStart := time.Now()
+					collision, err := findExactCollision(longerChain.seed, shorterChain.seed, delta, outBits)
+					if err != nil {
+						return nil, iterations, 0, time.Since(start), err
+					}
+					if !containColl(collisions, collision) { // если такой коллизии раньше не встречалось, то записываем в словарь
+						collisions = append(collisions, collision)
+						successTime += time.Since(collisionStart)
+					}
+					//	fmt.Printf("Collision (exact) found: %s = %s (worker %d at step %d vs worker %d at step %d, d=%d, coll=%s)\n",
+					//			collision.x, collision.y, longerChain.WID, longerChain.steps, shorterChain.WID, shorterChain.steps, delta, collision.x)
+					//	fmt.Printf("Мы нашли уже %d коллизий! Так держать!\n", len(collisions))
+					// Если нашли, но она уже есть - все эти данные просто выкидываем, считаем запуск плохим и делаем вид, что его и не было никогда.
+					// заново инициализируем цепочки
+					for key, chain := range dists { // удаляем значительную точку
+						if chain.seed == longerChain.seed || chain.seed == shorterChain.seed {
+							delete(dists, key)
+						}
+					}
+					err = reset(chains, longerChain.WID, outBits)
+					if err != nil {
+						return nil, iterations, 0, time.Since(start), err
+					}
+					err = reset(chains, shorterChain.WID, outBits)
+					if err != nil {
+						return nil, iterations, 0, time.Since(start), err
+					}
+					//	fmt.Println("Всё подчистили, иём дальше")
+				} else { // если не было такой отличительной точки, то записываем к себе в словарь
+					dists[chains[i].val] = chains[i]
+				}
+			}
+		}
+	}
+	// avgSuccessTime := time.Duration(0)
+	// if successCount > 0 {
+	// 	avgSuccessTime = successTime / time.Duration(successCount)
+	// }
+	mem := len(dists)*(outBits+3+int(unsafe.Sizeof(chains[0]))) + len(chains)*int(unsafe.Sizeof(chains[0]))*8
+	fmt.Printf("Pollard Attack Simulated (%d-bit): Found %d collisions after %d iterations (%s elapsed).\n",
+		outBits, len(collisions), iterations, successTime)
+	return collisions, iterations, mem, successTime, nil
 }
 
 // plotResults строит график и сохраняет его в файл.
-func plotResults(title, xLabel, yLabel, filename string, pts plotter.XYs) error {
+func plotCombinedResults(title, xLabel, yLabel, filename string, series ...interface{}) error {
 	p := plot.New()
 	p.Title.Text = title
 	p.X.Label.Text = xLabel
 	p.Y.Label.Text = yLabel
-	if err := plotutil.AddLinePoints(p, "data", pts); err != nil {
+
+	// series должна быть вида: "Лейбл1", pts1, "Лейбл2", pts2, ...
+	if err := plotutil.AddLinePoints(p, series...); err != nil {
 		return err
 	}
 	return p.Save(6*vg.Inch, 4*vg.Inch, filename)
@@ -286,7 +355,7 @@ func main() {
 
 	for _, bits := range OutBitsList {
 		fmt.Printf("\n=== Experiment for truncated output = %d bits ===\n", bits)
-		// Birthday Attack
+		//Birthday Attack
 		bColls, bIters, bMem, bElapsed, err := birthdayAttack(NumCollisionNeeded, bits)
 		if err != nil {
 			log.Fatalf("Birthday Attack error for %d bits: %v", bits, err)
@@ -298,10 +367,10 @@ func main() {
 			Memory:     bMem,
 			Collisions: bColls,
 		})
-		// Pollard Rho Attack (parallel)
+		//Pollard Attack
 		pColls, pIters, pMem, pElapsed, err := PollardAttack(bits, DistBits, NumCollisionNeeded, NumWorkers)
 		if err != nil {
-			log.Fatalf("Pollard Rho error for %d bits: %v", bits, err)
+			log.Fatalf("Pollard error for %d bits: %v", bits, err)
 		}
 		pResults = append(pResults, Result{
 			OutBits:    bits,
@@ -311,67 +380,78 @@ func main() {
 			Collisions: pColls,
 		})
 	}
-
-	// Выводим первые несколько коллизий для наибольшего значения outBits (например, 24 бит)
-	fmt.Println("\n=== Sample Collisions for outBits = 24 ===")
-	for _, r := range bResults {
-		if r.OutBits == 24 {
-			fmt.Println("Birthday Attack collisions (first 5):")
-			for i, cp := range r.Collisions {
-				if i >= 5 {
-					break
-				}
-				fmt.Printf("Collision %d: %s = %s\n", i+1, cp.x, cp.y)
-			}
-		}
+	collFile, err := os.Create("collisions_24.txt")
+	if err != nil {
+		log.Fatalf("Cannot create collisions file: %v", err)
 	}
-	for _, r := range pResults {
-		if r.OutBits == 24 {
-			fmt.Println("Pollard Rho Attack collisions (first 5):")
-			for i, cp := range r.Collisions {
-				if i >= 5 {
-					break
-				}
-				fmt.Printf("Collision %d: %s = %s\n", i+1, cp.x, cp.y)
-			}
-		}
+	defer collFile.Close()
+	collisions24 := pResults[len(pResults)-1].Collisions
+	limit := 100
+	if len(collisions24) < limit {
+		limit = len(collisions24)
 	}
+	for i := 0; i < limit; i++ {
+		hexX, err := binToHex(collisions24[i].x)
+		if err != nil {
+			log.Fatalf("Cannot write in file: %v", err)
+		}
+		hexY, err := binToHex(collisions24[i].y)
+		if err != nil {
+			log.Fatalf("Cannot write in file: %v", err)
+		}
+		fmt.Fprintf(collFile, "Collision %d: %s = %s\n", i+1, hexX, hexY)
+	}
+	fmt.Println("Collisions for 24-bit output saved to collisions_24.txt")
 
-	// Подготовка данных для построения графиков:
-	// По оси X: outBits, по оси Y: среднее время (мс) на одну коллизию и оценка памяти (в байтах).
+	// Подготовка данных для построения объединённых графиков
+	// График времени: ось X – outBits, ось Y – среднее время (мс) на одну коллизию
 	bTimePts := make(plotter.XYs, len(bResults))
-	bMemPts := make(plotter.XYs, len(bResults))
 	pTimePts := make(plotter.XYs, len(pResults))
-	pMemPts := make(plotter.XYs, len(pResults))
-
 	for i, res := range bResults {
 		avgTime := float64(res.Passed.Milliseconds()) / float64(NumCollisionNeeded)
 		bTimePts[i].X = float64(res.OutBits)
 		bTimePts[i].Y = avgTime
-		bMemPts[i].X = float64(res.OutBits)
-		bMemPts[i].Y = float64(res.Memory)
 	}
 	for i, res := range pResults {
 		avgTime := float64(res.Passed.Milliseconds()) / float64(NumCollisionNeeded)
 		pTimePts[i].X = float64(res.OutBits)
 		pTimePts[i].Y = avgTime
+	}
+
+	// График памяти: ось X – outBits, ось Y – оценка памяти (в байтах)
+	bMemPts := make(plotter.XYs, len(bResults))
+	pMemPts := make(plotter.XYs, len(pResults))
+	for i, res := range bResults {
+		bMemPts[i].X = float64(res.OutBits)
+		bMemPts[i].Y = float64(res.Memory)
+	}
+	for i, res := range pResults {
 		pMemPts[i].X = float64(res.OutBits)
 		pMemPts[i].Y = float64(res.Memory)
 	}
 
-	// Строим графики:
-	if err := plotResults("Birthday Attack: Average Time vs Output Bits", "Output Bits", "Avg Time (ms)", "birthday_time.png", bTimePts); err != nil {
-		log.Fatal(err)
-	}
-	if err := plotResults("Birthday Attack: Memory vs Output Bits", "Output Bits", "Memory (bytes)", "birthday_mem.png", bMemPts); err != nil {
-		log.Fatal(err)
-	}
-	if err := plotResults("Pollard Rho: Average Time vs Output Bits", "Output Bits", "Avg Time (ms)", "pollard_time.png", pTimePts); err != nil {
-		log.Fatal(err)
-	}
-	if err := plotResults("Pollard Rho: Memory vs Output Bits", "Output Bits", "Memory (bytes)", "pollard_mem.png", pMemPts); err != nil {
+	// Построим объединённые графики (для Birthday Attack и Pollard Rho)
+	err = plotCombinedResults(
+		"Time vs Output Bits (150 collisions)",
+		"Output Bits", "Time (ms)",
+		"graphs/time_cmp.png",
+		"Birthday Attack", bTimePts,
+		"Pollard Attack", pTimePts,
+	)
+	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println("Graphs saved as birthday_time.png, birthday_mem.png, pollard_time.png, pollard_mem.png")
+	err = plotCombinedResults(
+		"Memory vs Output Bits (150 collisions)",
+		"Output Bits", "Memory (bits)",
+		"graphs/memory_cmp.png",
+		"Birthday Attack", bMemPts,
+		"Pollard Attack", pMemPts,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("Graphs saved as combined_time.png and combined_memory.png")
 }
