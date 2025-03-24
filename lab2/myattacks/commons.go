@@ -7,8 +7,6 @@ import (
 	"math/big"
 )
 
-// --- Константы ---
-// Размер куска хэш-функции для нахождения коллизии
 const (
 	MinOut             = 8
 	MaxOut             = 24
@@ -24,6 +22,7 @@ type Collision struct {
 	Y string
 }
 
+// звено для хранения информации о состоянии цепочки
 type Chain struct {
 	seed  string
 	val   string
@@ -46,6 +45,7 @@ func SHA_xx(msg []byte, outbits int) (string, error) {
 	return fmt.Sprintf("%0*b", outbits, result), nil
 }
 
+// проверяет, встречалась ли такая коллизия ранее
 func containColl(arr []Collision, data Collision) bool {
 	for _, val := range arr {
 		if val.X == data.X && val.Y == data.Y || val.X == data.Y && val.Y == data.X {
@@ -55,6 +55,7 @@ func containColl(arr []Collision, data Collision) bool {
 	return false
 }
 
+// перевод двоичной строки в хекс-значение
 func BinToHex(binStr string) (string, error) {
 	n, ok := new(big.Int).SetString(binStr, 2)
 	if !ok {

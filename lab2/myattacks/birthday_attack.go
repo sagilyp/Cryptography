@@ -10,8 +10,6 @@ import (
 )
 
 // Атака на основе парадокса о днях рождения
-// Ищет num коллизий для усечённой хэш функции
-// возвращает список найденных коллизий и кол-во итераций
 func BirthdayAttack(num int, outBits int) ([]Collision, int, int, time.Duration, error) {
 	collisions := []Collision{}
 	dict := make(map[string]string)

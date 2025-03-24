@@ -23,14 +23,11 @@ type Result struct {
 	Collisions []myattacks.Collision
 }
 
-// plotResults строит график и сохраняет его в файл.
-func plotCombinedResults(title, xLabel, yLabel, filename string, series ...interface{}) error {
+func plotResults(title, xLabel, yLabel, filename string, series ...interface{}) error {
 	p := plot.New()
 	p.Title.Text = title
 	p.X.Label.Text = xLabel
 	p.Y.Label.Text = yLabel
-
-	// series должна быть вида: "Лейбл1", pts1, "Лейбл2", pts2, ...
 	if err := plotutil.AddLinePoints(p, series...); err != nil {
 		return err
 	}
@@ -38,7 +35,6 @@ func plotCombinedResults(title, xLabel, yLabel, filename string, series ...inter
 }
 
 func main() {
-	// Запустим эксперименты для разных значений outBits из outBitsList.
 	var bResults []Result
 	var pResults []Result
 
@@ -92,22 +88,20 @@ func main() {
 	}
 	fmt.Println("Collisions for 24-bit output saved to collisions_24.txt")
 
-	// Подготовка данных для построения объединённых графиков
-	// График времени: ось X – outBits, ось Y – среднее время (мс) на одну коллизию
+	// подготовка данных для построения сравнительных графиков
+	// и дальнейщая их постройка
 	bTimePts := make(plotter.XYs, len(bResults))
 	pTimePts := make(plotter.XYs, len(pResults))
 	for i, res := range bResults {
-		avgTime := float64(res.Passed.Milliseconds()) / float64(myattacks.NumCollisionNeeded)
+		time := float64(res.Passed.Milliseconds())
 		bTimePts[i].X = float64(res.OutBits)
-		bTimePts[i].Y = avgTime
+		bTimePts[i].Y = time
 	}
 	for i, res := range pResults {
-		avgTime := float64(res.Passed.Milliseconds()) / float64(myattacks.NumCollisionNeeded)
+		time := float64(res.Passed.Milliseconds())
 		pTimePts[i].X = float64(res.OutBits)
-		pTimePts[i].Y = avgTime
+		pTimePts[i].Y = time
 	}
-
-	// График памяти: ось X – outBits, ось Y – оценка памяти (в байтах)
 	bMemPts := make(plotter.XYs, len(bResults))
 	pMemPts := make(plotter.XYs, len(pResults))
 	for i, res := range bResults {
@@ -118,9 +112,7 @@ func main() {
 		pMemPts[i].X = float64(res.OutBits)
 		pMemPts[i].Y = float64(res.Memory)
 	}
-
-	// Построим объединённые графики (для Birthday Attack и Pollard Rho)
-	err = plotCombinedResults(
+	err = plotResults(
 		"Time vs Output Bits (150 collisions)",
 		"Output Bits", "Time (ms)",
 		"graphs/time_cmp.png",
@@ -130,8 +122,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	err = plotCombinedResults(
+	err = plotResults(
 		"Memory vs Output Bits (150 collisions)",
 		"Output Bits", "Memory (bits)",
 		"graphs/memory_cmp.png",
@@ -141,6 +132,5 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	fmt.Println("Graphs saved as combined_time.png and combined_memory.png")
+	fmt.Println("Graphs saved as time_cmp.png and memory_cmp.png")
 }
