@@ -78,6 +78,8 @@ func (mm *MyMAC) SetKey(newkey []byte) error {
 			return err
 		}
 		mm.hmacHash.Write(mm.k1)
+	default:
+		return fmt.Errorf("undefined algorithm %s", mm.mode)
 	}
 	return nil
 }
@@ -104,6 +106,7 @@ func (mm *MyMAC) MacAddBlock(dataBlock []byte) error {
 			prevState = mm.state
 		} else {
 			prevState = make([]byte, AESBlockSize)
+			mm.state = make([]byte, AESBlockSize)
 		}
 		xored, err := xorBytes(prevState, dataBlock)
 		if err != nil {
@@ -115,10 +118,21 @@ func (mm *MyMAC) MacAddBlock(dataBlock []byte) error {
 		}
 		mm.state = newState
 	case HMAC:
-		_, err := mm.hmacHash.Write(dataBlock)
+		var err error
+		if len(mm.state) != AESBlockSize && mm.k1 != nil {
+			_, err = mm.hmacHash.Write(mm.k1)
+			if err != nil {
+				return err
+			}
+			mm.state = make([]byte, AESBlockSize)
+		}
+		_, err = mm.hmacHash.Write(dataBlock)
 		if err != nil {
 			return err
 		}
+		mm.state = dataBlock
+	default:
+		return fmt.Errorf("undefined algorithm %s", mm.mode)
 	}
 	return nil
 }
@@ -150,11 +164,11 @@ func (mm *MyMAC) MacFinalize(lastBlock []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
-		X, err := mm.AesBlockEncrypt(xored)
+		tag, err := mm.AesBlockEncrypt(xored)
 		if err != nil {
 			return nil, err
 		}
-		return X[:OMACTagSize], nil
+		return tag[:OMACTagSize], nil
 	case TRUNCATED:
 		var xored []byte
 		if len(lastBlock) == AESBlockSize {
@@ -177,26 +191,29 @@ func (mm *MyMAC) MacFinalize(lastBlock []byte) ([]byte, error) {
 				return nil, err
 			}
 		}
-		X, err := mm.AesBlockEncrypt(xored)
+		tag, err := mm.AesBlockEncrypt(xored)
 		if err != nil {
 			return nil, err
 		}
-		return X[:TruncTagSize], nil
+		return tag[:TruncTagSize], nil
 	case HMAC:
-		tag := mm.hmacHash.Sum(nil)
-		return tag[:HMACTagSize], nil
+		mm.MacAddBlock(lastBlock)
+		innerHash := mm.hmacHash.Sum(nil)                       // H(k1 || message)
+		outerHash := sha256.Sum256(append(mm.k2, innerHash...)) // H(k2 || H(k1 || message))
+		return outerHash[:HMACTagSize], nil
 	default:
-		return nil, errors.New("unknown MAC algorithm")
+		return nil, fmt.Errorf("undefined algorithm %s", mm.mode)
 	}
 }
 
 // ComputeMac вычисляет MAC для данных за один вызов, используя MacAddBlock и MacFinalize
 func (mm *MyMAC) ComputeMac(message []byte) ([]byte, error) {
+	if mm.mode != HMAC && mm.mode != OMAC && mm.mode != TRUNCATED {
+		return nil, fmt.Errorf("undefined algorithm %s", mm.mode)
+	}
+	mm.state = nil // сброс состояний
 	if mm.mode == HMAC {
 		mm.hmacHash.Reset() // чистим от мусора
-		mm.MacAddBlock(mm.k2)
-		innerHash := sha256.Sum256(append(mm.k1, message...)) // H(k1 || message)
-		message = innerHash[:]
 	}
 	for len(message) > AESBlockSize {
 		block := message[:AESBlockSize]
@@ -247,6 +264,8 @@ func (mm *MyMAC) generateSubkeys() error {
 			K1[i] = mm.key[i] ^ 0x36
 			K2[i] = mm.key[i] ^ 0x5c
 		}
+	default:
+		return fmt.Errorf("undefined algorithm %s", mm.mode)
 	}
 	mm.k1, mm.k2 = K1, K2
 	return nil
